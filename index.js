@@ -148,6 +148,76 @@ function buildSummary(text) {
  *
  * @param ctx - the Host plugin context.
  */
+/**
+ * Locate one message's full text, in three tiers.
+ *
+ * Shared by the `quote_read` tool (the model) and `/quote-shot/message` (the
+ * client, which draws the sent-message card). Both need the same answer, so the
+ * search lives here instead of being duplicated.
+ *
+ * @param ctx - the Host plugin context (for the live-agent registry).
+ * @param messageId - the message id to find.
+ * @returns `{ text, via, sessionId }`, or null when nothing matched.
+ */
+function resolveMessageText(ctx, messageId) {
+  const startedAt = Date.now();
+  const tried = [];
+
+  // 1. The session the client reported when the quote was placed. This is the
+  //    exact answer, and the only step that works when the caller is not the
+  //    session that owns the message.
+  const hinted = quoteHints.get(messageId);
+  if (typeof hinted === 'string' && hinted.length > 0) {
+    tried.push(hinted);
+    const text = readMessageById(hinted, messageId);
+    if (text !== null) {
+      trace(`lookup session=${hinted} message=${messageId} len=${text.length} via=hint`);
+      return { text, via: 'hint', sessionId: hinted };
+    }
+  }
+
+  // 2. Every live agent, newest first. Background subagents are live agents
+  //    too, so "the last one" is not a safe guess.
+  let live = [];
+  try {
+    live = ctx.agents.list();
+  } catch {
+    live = [];
+  }
+  for (let index = live.length - 1; index >= 0; index -= 1) {
+    const sessionId = live[index]?.session?.id;
+    if (typeof sessionId !== 'string' || sessionId.length === 0) continue;
+    if (tried.includes(sessionId)) continue;
+    tried.push(sessionId);
+    const text = readMessageById(sessionId, messageId);
+    if (text !== null) {
+      trace(`lookup session=${sessionId} message=${messageId} len=${text.length} via=live`);
+      return { text, via: 'live', sessionId };
+    }
+  }
+
+  // 3. On-disk scan of the most recently used logs: covers a restarted DSH or a
+  //    conversation that is no longer live. Message ids are UUIDs.
+  let sources = [];
+  try {
+    sources = listRecentSessionFiles(25);
+  } catch {
+    sources = [];
+  }
+  for (const source of sources) {
+    const text = readMessageFromFile(source.file, messageId);
+    if (text !== null) {
+      trace(`lookup session=${source.sessionId} message=${messageId} len=${text.length} via=scan`);
+      return { text, via: 'scan', sessionId: source.sessionId };
+    }
+  }
+
+  // Failure MUST be traced. Silently returning "not found" is exactly how the
+  // earlier bug stayed invisible.
+  trace(`lookup MISS message=${messageId} tried=[${tried.join(', ')}] scanned=${sources.length} ms=${Date.now() - startedAt}`);
+  return null;
+}
+
 export function apply(ctx) {
   ctx.effect(
     () =>
@@ -307,6 +377,48 @@ export function apply(ctx) {
     'quote-shot: hint route'
   );
 
+  // Client-side message text lookup, for the sent-message card.
+  //
+  // The card shows the quoted body when opened, but the renderer cannot call a
+  // model tool. This exposes the same three-tier lookup over HTTP so the card
+  // does not have to duplicate any of it.
+  ctx.effect(
+    () =>
+      ctx.webServer.register({
+        kind: 'exact',
+        path: '/quote-shot/message',
+        handler: async (request, response) => {
+          const reply = (status, body) => {
+            response.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+            response.end(JSON.stringify(body));
+          };
+          if (request.method !== 'POST') {
+            response.writeHead(405, { allow: 'POST' });
+            response.end();
+            return;
+          }
+          const body = await readJson(request);
+          if (body === null) {
+            reply(400, { ok: false, code: 'bad-json' });
+            return;
+          }
+          const messageId = typeof body.messageId === 'string' ? body.messageId.trim() : '';
+          if (messageId.length === 0) {
+            reply(400, { ok: false, code: 'missing-messageId' });
+            return;
+          }
+          const found = resolveMessageText(ctx, messageId);
+          if (found === null) {
+            reply(200, { ok: false, code: 'not-found' });
+            return;
+          }
+          trace(`card message=${messageId} len=${found.text.length} via=${found.via}`);
+          reply(200, { ok: true, text: found.text });
+        }
+      }),
+    'quote-shot: message route'
+  );
+
   // The `quote_read` tool: read a message's full text by id.
   //
   // This is what makes "quote by reference" possible — the composer carries only
@@ -369,74 +481,9 @@ export function apply(ctx) {
           async execute(args) {
             const messageId = typeof args?.messageId === 'string' ? args.messageId.trim() : '';
             if (messageId.length === 0) return { found: false, messageId: '', error: 'missing-messageId' };
-
-            const startedAt = Date.now();
-            const tried = [];
-
-            // 1. The session the client reported when the quote was placed.
-            //    This is the exact answer, and it is the only step that works
-            //    when the caller is not the session that owns the message.
-            const hinted = quoteHints.get(messageId);
-            if (typeof hinted === 'string' && hinted.length > 0) {
-              tried.push(hinted);
-              const text = readMessageById(hinted, messageId);
-              if (text !== null) {
-                trace(`quote_read session=${hinted} message=${messageId} len=${text.length} via=hint`);
-                return { found: true, messageId, text };
-              }
-            }
-
-            // 2. Every live agent, newest first.
-            //
-            //    The previous version used ONLY the last registered agent. That
-            //    is wrong: Mnemon's idle checkpoint reviewer runs as a live
-            //    subagent, so "the last live agent" can be a background reviewer
-            //    session that has never seen the quoted message. Iterating all of
-            //    them costs one Map lookup per agent and removes the guess.
-            let live = [];
-            try {
-              live = ctx.agents.list();
-            } catch {
-              live = [];
-            }
-            for (let index = live.length - 1; index >= 0; index -= 1) {
-              const sessionId = live[index]?.session?.id;
-              if (typeof sessionId !== 'string' || sessionId.length === 0) continue;
-              if (tried.includes(sessionId)) continue;
-              tried.push(sessionId);
-              const text = readMessageById(sessionId, messageId);
-              if (text !== null) {
-                trace(`quote_read session=${sessionId} message=${messageId} len=${text.length} via=live`);
-                return { found: true, messageId, text };
-              }
-            }
-
-            // 3. On-disk scan of the most recently used logs.
-            //
-            //    Covers the case no registry can: DSH restarted, or the quoted
-            //    message belongs to a conversation that is no longer live. Message
-            //    ids are UUIDs, so a hit is unambiguous.
-            let sources = [];
-            try {
-              sources = listRecentSessionFiles(25);
-            } catch {
-              sources = [];
-            }
-            for (const source of sources) {
-              const text = readMessageFromFile(source.file, messageId);
-              if (text !== null) {
-                trace(`quote_read session=${source.sessionId} message=${messageId} len=${text.length} via=scan`);
-                return { found: true, messageId, text };
-              }
-            }
-
-            // Failure MUST be traced. Silently returning `not-found` is exactly
-            // how this bug stayed invisible: the UI showed a message it could not
-            // find, and the log had nothing.
-            trace(
-              `quote_read MISS message=${messageId} tried=[${tried.join(', ')}] scanned=${sources.length} ms=${Date.now() - startedAt}`
-            );
-            return { found: false, messageId, error: 'not-found' };
+            const found = resolveMessageText(ctx, messageId);
+            if (found === null) return { found: false, messageId, error: 'not-found' };
+            return { found: true, messageId, text: found.text };
           }
         });
         trace('tool quote_read registered');

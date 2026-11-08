@@ -704,12 +704,179 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * The one-line marker this plugin puts in the composer.
+     *
+     * Group 1 is the message id. Kept in sync with the string built in
+     * QuoteActions; the quote em-dash is part of the contract.
+     */
+    const QUOTE_MARK = /\[引用消息\s+([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\s*——[^\]]*\]/g;
+
+    /** Rule id for sent bubbles; must not collide with DSH's own user-text rules. */
+    const CARD_NODE = 'dsh-quote-shot-card';
+
+    /**
+     * userText rule: find one quote marker at or after `from`.
+     *
+     * DSH runs these rules over the text of a SENT user message and lets the
+     * plugin replace the matched span with a React node, which is how a plain
+     * `[引用消息 …]` turns into a card in the bubble.
+     */
+    const quoteRule = {
+      id: CARD_NODE,
+      order: 15,
+      match(text, from) {
+        QUOTE_MARK.lastIndex = from;
+        const m = QUOTE_MARK.exec(text);
+        if (m === null) return undefined;
+        return {
+          id: CARD_NODE,
+          start: m.index,
+          end: m.index + m[0].length,
+          data: { messageId: m[1] }
+        };
+      }
+    };
+
+    /**
+     * The card a sent quote renders as.
+     *
+     * It shows nothing about the quoted text until opened: the marker carries
+     * only an id, and prefetching the body for every card would fire a request
+     * per quote on every render. Opening asks the Host for the text once and
+     * caches it on the component.
+     *
+     * @param props - `node` from the rule (`data.messageId`, `data.text`/`note`).
+     * @returns the card element.
+     */
+    function SentQuoteCard(props) {
+      const node = props.node ?? {};
+      const messageId = String(node?.data?.messageId ?? '');
+      const [open, setOpen] = react.useState(false);
+      const [body, setBody] = react.useState(null);
+      const [state, setState] = react.useState('idle');
+
+      const toggle = async () => {
+        if (open) {
+          setOpen(false);
+          return;
+        }
+        setOpen(true);
+        if (body !== null || state === 'loading') return;
+        setState('loading');
+        try {
+          const response = await fetch('/quote-shot/message', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ messageId })
+          });
+          const payload = await response.json();
+          if (payload.ok === true) {
+            setBody(String(payload.text ?? ''));
+            setState('done');
+          } else {
+            setBody('（找不到这条消息的正文）');
+            setState('missing');
+          }
+        } catch {
+          setBody('（读取失败）');
+          setState('error');
+        }
+      };
+
+      const shortId = messageId.slice(0, 8);
+      const children = [];
+
+      children.push(
+        h(
+          'span',
+          {
+            key: 'head',
+            style: {
+              display: 'flex',
+              alignItems: 'center',
+              gap: '6px',
+              fontSize: '12px',
+              lineHeight: '16px',
+              color: 'color-mix(in srgb, currentColor 58%, transparent)'
+            }
+          },
+          h('span', { 'aria-hidden': 'true' }, '\u275D'),
+          h('span', null, `引用 ${shortId}`),
+          h(
+            'span',
+            { style: { opacity: 0.6 } },
+            open ? '收起' : state === 'loading' ? '读取中…' : '展开'
+          )
+        )
+      );
+
+      if (open) {
+        children.push(
+          h(
+            'span',
+            {
+              key: 'body',
+              style: {
+                display: 'block',
+                marginTop: '6px',
+                maxHeight: '220px',
+                overflowY: 'auto',
+                whiteSpace: 'pre-wrap',
+                overflowWrap: 'anywhere',
+                fontSize: '13px',
+                lineHeight: '1.55',
+                color: 'color-mix(in srgb, currentColor 80%, transparent)'
+              }
+            },
+            state === 'loading' ? '…' : body ?? ''
+          )
+        );
+      }
+
+      return h(
+        'span',
+        {
+          role: 'button',
+          tabIndex: 0,
+          onClick: toggle,
+          onKeyDown: (event) => {
+            if (event.key === 'Enter' || event.key === ' ') {
+              event.preventDefault();
+              toggle();
+            }
+          },
+          style: {
+            display: 'block',
+            margin: '2px 0 6px',
+            padding: '3px 8px',
+            borderLeft: '2px solid color-mix(in srgb, currentColor 35%, transparent)',
+            borderRadius: 'var(--dsw-radius-sm, 6px)',
+            background: 'color-mix(in srgb, currentColor 6%, transparent)',
+            cursor: 'pointer',
+            userSelect: 'text'
+          }
+        },
+        ...children
+      );
+    }
+
+    /**
      * Register the dictionaries, the message action and the composer cards.
      *
      * @param ctx - the client plugin context.
      */
     function apply(ctx) {
       ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'quote-shot: dictionaries');
+
+      // Sent bubble: the marker becomes a card instead of a run of grey text.
+      ctx.effect(() => ctx.uiConversation.userText.register(quoteRule), 'quote-shot: user-text rule');
+      ctx.slots.inject('conversation.user.text.node', () =>
+        ctx.slots.register(
+          { name: 'conversation.user.text.node', key: CARD_NODE, priority: 100 },
+          SentQuoteCard
+        )
+      );
 
       ctx.slots.inject('conversation.chat.assistant-actions', () =>
         ctx.slots.register(
@@ -742,9 +909,10 @@ window.__ModuleLoader__.load({
     }
 
     exports.apply = apply;
-    exports.inject = ['slots', 'locale'];
+    exports.inject = ['slots', 'locale', 'uiConversation'];
     exports.QuoteActions = QuoteActions;
     exports.QuoteCard = QuoteCard;
+    exports.SentQuoteCard = SentQuoteCard;
     exports.readQuoteText = readQuoteText;
     exports.previewOf = previewOf;
     exports.injectQuote = injectQuote;

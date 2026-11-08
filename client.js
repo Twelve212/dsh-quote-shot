@@ -202,7 +202,7 @@ window.__ModuleLoader__.load({
           chain.push(`${node.tagName?.toLowerCase()}.${cls.slice(0, 22)}[${bits.join(',')}]`);
           node = node.parentElement;
         }
-        report('anchor-chain', { rowFound: row !== null && row !== undefined, chain });
+        postLog('anchor-chain', { rowFound: row !== null && row !== undefined, chain });
       } catch {
         /* diagnostics never break the click */
       }

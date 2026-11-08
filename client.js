@@ -274,7 +274,19 @@ window.__ModuleLoader__.load({
 
       const paint = () => {
         const rect = row.getBoundingClientRect();
+        postLog('flash-paint', {
+          top: Math.round(rect.top),
+          bottom: Math.round(rect.bottom),
+          width: Math.round(rect.width),
+          height: Math.round(rect.height),
+          viewport: window.innerHeight
+        });
         if (rect.width === 0 || rect.height === 0) return;
+
+        // Keep the line inside the viewport: a tall row centred by scrollIntoView
+        // can have its bottom below the fold, and a line drawn there is invisible.
+        const maxY = window.innerHeight - 14;
+        const y = Math.max(12, Math.min(rect.bottom, maxY));
         const line = document.createElement('div');
         line.style.cssText = [
           'position:fixed',
@@ -282,7 +294,7 @@ window.__ModuleLoader__.load({
           'z-index:2147483000',
           `left:${rect.left + rect.width * 0.06}px`,
           `width:${rect.width * 0.88}px`,
-          `top:${rect.bottom - 2}px`,
+          `top:${y - 2}px`,
           'height:3px',
           'border-radius:2px',
           'background:linear-gradient(90deg,transparent 0%,#4d6bfe 18%,#4d6bfe 82%,transparent 100%)',

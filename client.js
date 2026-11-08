@@ -15,6 +15,8 @@ window.__ModuleLoader__.load({
   factory: (require) => {
     var module = { exports: {} };
     var exports = module.exports;
+    /** Plugin context, for the components that need services outside a slot. */
+    let pluginCtx = null;
     Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' });
 
     const react = require('react');
@@ -468,6 +470,30 @@ window.__ModuleLoader__.load({
           return;
         }
 
+        // The marker lands at the caret, so anything already typed ends up ABOVE
+        // it — and DSH renders nodes in text order, which puts the card below the
+        // user's own words. Move the marker to the top of the draft instead.
+        //
+        // Only when the draft carries no reference chips: shifting text under a
+        // chip would corrupt its offset. Best-effort — if the draft API is not
+        // reachable, the marker simply stays where it was inserted.
+        try {
+          const actx = pluginCtx?.sessions?.scope?.(sessionId);
+          const input = actx === undefined || actx === null ? undefined : pluginCtx?.conversation?.input?.for?.(actx);
+          const snapshot = input?.draftSnapshot;
+          const noChips = Array.isArray(snapshot?.references) && snapshot.references.length === 0;
+          if (noChips && typeof snapshot.text === 'string') {
+            const index = snapshot.text.lastIndexOf(marker);
+            const before = index > 0 ? snapshot.text.slice(0, index).replace(/\s+$/, '') : '';
+            if (index > 0 && before.length > 0) {
+              const after = snapshot.text.slice(index + marker.length);
+              input.setDraft({ text: `${marker}\n${before}${after}`, references: [] });
+            }
+          }
+        } catch {
+          report('reorder-skipped', { messageId });
+        }
+
         // Record the id -> session pair before the marker leaves the client, so
         // `quote_read` can resolve the owner instead of guessing a live agent.
         postHint(messageId, sessionId);
@@ -805,7 +831,14 @@ window.__ModuleLoader__.load({
           h('span', null, `引用 ${shortId}`),
           h(
             'span',
-            { style: { opacity: 0.6 } },
+            {
+              key: 'toggle',
+              style: {
+                // Push the action to the right edge of the card.
+                marginLeft: 'auto',
+                opacity: 0.6
+              }
+            },
             open ? '收起' : state === 'loading' ? '读取中…' : '展开'
           )
         )
@@ -867,6 +900,7 @@ window.__ModuleLoader__.load({
      * @param ctx - the client plugin context.
      */
     function apply(ctx) {
+      pluginCtx = ctx;
       ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'quote-shot: dictionaries');
 
       // Sent bubble: the marker becomes a card instead of a run of grey text.
@@ -909,7 +943,7 @@ window.__ModuleLoader__.load({
     }
 
     exports.apply = apply;
-    exports.inject = ['slots', 'locale', 'uiConversation'];
+    exports.inject = ['slots', 'locale', 'uiConversation', 'conversation', 'sessions'];
     exports.QuoteActions = QuoteActions;
     exports.QuoteCard = QuoteCard;
     exports.SentQuoteCard = SentQuoteCard;

@@ -242,6 +242,8 @@ console.log('\napply() wiring');
   const localeRegs = [];
   const slotInjections = [];
   const seats = [];
+  const sources = [];
+  const rules = [];
   const ctx = {
     effect(fn) {
       return fn();
@@ -261,14 +263,43 @@ console.log('\napply() wiring');
       register(spec, component) {
         return { spec, component };
       }
-    }
+    },
+    // Services added by the card / chip work. The mock has to model them, or
+    // apply() throws on the first dereference and every later check is noise.
+    inputTriggers: {
+      registerSource(source) {
+        sources.push(source);
+        return () => {};
+      }
+    },
+    uiConversation: {
+      userText: {
+        register(rule) {
+          rules.push(rule);
+          return () => {};
+        }
+      }
+    },
+    conversation: { input: { for: () => undefined } },
+    sessions: { scope: () => null }
   };
   api.apply(ctx);
   check('registers the dictionaries', localeRegs.length === 1 && localeRegs[0].namespace === 'quoteShot', JSON.stringify(localeRegs.map((r) => r.namespace)));
   check('dictionaries carry zh and en', Boolean(localeRegs[0]?.dictionaries?.zh && localeRegs[0]?.dictionaries?.en));
-  check('injects into two slots', slotInjections.length === 2, slotInjections.join(','));
-  check('first seat is the message action', slotInjections[0] === 'conversation.chat.assistant-actions', slotInjections[0]);
-  check('second seat is the composer dock', slotInjections[1] === 'conversation.input.dock', slotInjections[1]);
+  check('registers the chip source', sources.length === 1 && sources[0].name === 'quote-shot', JSON.stringify(sources.map((s) => s.name)));
+  check(
+    'chip codec covers clipboard and serialize',
+    typeof sources[0]?.codec?.clipboardText === 'function' && typeof sources[0]?.codec?.serialize === 'function'
+  );
+  check(
+    'chip serialises to the same marker',
+    sources[0]?.codec?.clipboardText('abcdefgh-0000-0000-0000-000000000000')?.startsWith('[引用消息 abcdefgh-') === true
+  );
+  check('registers the user-text rule', rules.length === 1 && rules[0].id === 'dsh-quote-shot-card', String(rules[0]?.id));
+  check('injects into three slots', slotInjections.length === 3, slotInjections.join(','));
+  check('seat order: user text, message action, composer dock', slotInjections[0] === 'conversation.user.text.node', slotInjections[0]);
+  check('second seat is the message action', slotInjections[1] === 'conversation.chat.assistant-actions', slotInjections[1]);
+  check('third seat is the composer dock', slotInjections[2] === 'conversation.input.dock', slotInjections[2]);
   const actionSeat = seats.find((s) => s?.spec?.id === 'quote');
   const cardSeat = seats.find((s) => s?.spec?.id === 'quote-card');
   check('registers the action component', actionSeat?.component === api.QuoteActions);

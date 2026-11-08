@@ -184,26 +184,32 @@ window.__ModuleLoader__.load({
      * @param row - the message row element.
      */
     function rememberAnchor(messageId, row) {
-      const key = row?.getAttribute?.('data-chat-anchor-key');
-      if (typeof key !== 'string' || key.length === 0) return;
-      const turn = row?.getAttribute?.('data-chat-turn') ?? null;
-      // One diagnostic shot of the ancestor chain: it is the only way to learn
-      // which level actually wraps a whole message on this DSH build.
+      // Diagnose FIRST: the previous version returned before this ran whenever
+      // `closest` missed, which is exactly the case worth seeing. Records the
+      // whole ancestor chain (tag, class head, data-* attrs) so the real wrapper
+      // can be identified from outside.
       try {
         const chain = [];
         let node = row;
-        for (let depth = 0; depth < 8 && node !== null; depth += 1) {
-          const attrs = [];
+        for (let depth = 0; depth < 10 && node !== null && node !== undefined; depth += 1) {
+          const bits = [];
           for (const attr of node.attributes ?? []) {
-            if (attr.name.startsWith('data-chat')) attrs.push(`${attr.name.replace('data-chat-', '')}=${String(attr.value).slice(0, 24)}`);
+            if (!attr.name.startsWith('data-')) continue;
+            bits.push(`${attr.name}=${String(attr.value).slice(0, 20)}`);
+            if (bits.length >= 3) break;
           }
-          chain.push(`${node.tagName?.toLowerCase()}[${attrs.join(',')}]`);
+          const cls = String(node.className ?? '').split(/\s+/).filter(Boolean)[0] ?? '';
+          chain.push(`${node.tagName?.toLowerCase()}.${cls.slice(0, 22)}[${bits.join(',')}]`);
           node = node.parentElement;
         }
-        report('anchor-chain', { key: key.slice(0, 24), turn, chain });
+        report('anchor-chain', { rowFound: row !== null && row !== undefined, chain });
       } catch {
         /* diagnostics never break the click */
       }
+
+      const key = row?.getAttribute?.('data-chat-anchor-key');
+      if (typeof key !== 'string' || key.length === 0) return;
+      const turn = row?.getAttribute?.('data-chat-turn') ?? null;
       try {
         const all = JSON.parse(localStorage.getItem(ANCHOR_STORE) ?? '{}');
         delete all[messageId];

@@ -199,9 +199,10 @@ window.__ModuleLoader__.load({
      *
      * @param messageId - quoted message id.
      * @param sessionId - the session owning the composer.
+     * @param preview - the quoted text, used for the chip's label.
      * @returns true when the draft was rewritten.
      */
-    function insertQuoteChip(messageId, sessionId) {
+    function insertQuoteChip(messageId, sessionId, preview) {
       const actx = pluginCtx?.sessions?.scope?.(sessionId);
       const input = actx === undefined || actx === null ? undefined : pluginCtx?.conversation?.input?.for?.(actx);
       const snapshot = input?.draftSnapshot;
@@ -209,12 +210,18 @@ window.__ModuleLoader__.load({
 
       const marker = buildMarker(messageId);
       const added = `${marker}\n`;
+      // An id alone tells the reader nothing; the opening words do.
+      const flat = String(preview ?? '').replace(/\s+/g, ' ').trim();
+      const label =
+        flat.length === 0
+          ? `引用 ${messageId.slice(0, 8)}`
+          : `引用 · ${flat.slice(0, 28)}${flat.length > 28 ? '…' : ''}`;
       const chip = {
         source: CHIP_SOURCE,
         ref: messageId,
         offset: 0,
         length: marker.length,
-        label: `引用 ${messageId.slice(0, 8)}`,
+        label,
         clipboardText: marker
       };
       const references = (Array.isArray(snapshot.references) ? snapshot.references : [])
@@ -733,7 +740,7 @@ window.__ModuleLoader__.load({
         let inserted = false;
         let usedChip = false;
         try {
-          inserted = insertQuoteChip(messageId, sessionId);
+          inserted = insertQuoteChip(messageId, sessionId, text);
           usedChip = inserted;
         } catch (error) {
           postLog('chip-insert-failed', { messageId, detail: String((error && error.message) || error) });

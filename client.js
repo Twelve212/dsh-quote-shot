@@ -256,37 +256,44 @@ window.__ModuleLoader__.load({
     function jumpToMessage(messageId) {
       const record = anchorFor(messageId);
       if (record === null) return false;
+
+      // Anchor keys look like `9:turn-tail1` — `<turn>:<part>`. The row we
+      // recorded is the turn's TAIL (that is where message actions live), so
+      // jumping to it framed the last block of the reply instead of the reply.
+      // Jump to the first row sharing the turn prefix instead.
+      const key = record.key;
+      const colon = key.indexOf(':');
+      const prefix = colon > 0 ? key.slice(0, colon + 1) : null;
+
       let row = null;
-      try {
-        row = document.querySelector(`[data-chat-anchor-key="${CSS.escape(record.key)}"]`);
-      } catch {
-        row = null;
+      if (prefix !== null) {
+        try {
+          const group = document.querySelectorAll(`[data-chat-anchor-key^="${prefix}"]`);
+          if (group.length > 0) row = group[0];
+        } catch {
+          row = null;
+        }
+      }
+      if (row === null) {
+        try {
+          row = document.querySelector(`[data-chat-anchor-key="${CSS.escape(key)}"]`);
+        } catch {
+          row = null;
+        }
       }
       if (row === null) return false;
 
-      // Widen to the exchange: the anchor row is only the last block of the
-      // message (often a tool or file-change card), not the message itself.
-      let target = row;
-      if (record.turn !== null) {
-        try {
-          const scoped = row.closest(`[data-chat-turn="${CSS.escape(record.turn)}"]`);
-          if (scoped !== null) target = scoped;
-        } catch {
-          /* keep the row */
-        }
-      }
-
-      target.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      const previousOutline = target.style.outline;
-      const previousOffset = target.style.outlineOffset;
-      const previousRadius = target.style.borderRadius;
-      target.style.outline = '2px solid #4d6bfe';
-      target.style.outlineOffset = '3px';
-      target.style.borderRadius = '10px';
+      row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      const previousOutline = row.style.outline;
+      const previousOffset = row.style.outlineOffset;
+      const previousRadius = row.style.borderRadius;
+      row.style.outline = '2px solid #4d6bfe';
+      row.style.outlineOffset = '3px';
+      row.style.borderRadius = '10px';
       setTimeout(() => {
-        target.style.outline = previousOutline;
-        target.style.outlineOffset = previousOffset;
-        target.style.borderRadius = previousRadius;
+        row.style.outline = previousOutline;
+        row.style.outlineOffset = previousOffset;
+        row.style.borderRadius = previousRadius;
       }, 1500);
       return true;
     }

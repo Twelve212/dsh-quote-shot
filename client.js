@@ -172,6 +172,61 @@ window.__ModuleLoader__.load({
     const ANCHOR_LIMIT = 200;
 
     /**
+     * Chip source name.
+     *
+     * DSH renders a composer chip when the draft carries a reference of this
+     * source. The chip exists only for APPEARANCE: its label is a short tag, its
+     * clipboardText and serialised form are the same marker we have always sent,
+     * so the model and `quote_read` see exactly what they saw before.
+     */
+    const CHIP_SOURCE = 'quote-shot';
+
+    /**
+     * The marker that travels with the message.
+     *
+     * @param messageId - quoted message id.
+     * @returns the instruction line.
+     */
+    function buildMarker(messageId) {
+      return `[引用消息 ${messageId}——请先调用 quote_read 读取全文，再回答]`;
+    }
+
+    /**
+     * Insert one quote chip at the very top of the draft.
+     *
+     * Done as a single `setDraft` rather than insert-then-reorder: a chip has an
+     * offset, so moving text after the fact would desynchronise it.
+     *
+     * @param messageId - quoted message id.
+     * @param sessionId - the session owning the composer.
+     * @returns true when the draft was rewritten.
+     */
+    function insertQuoteChip(messageId, sessionId) {
+      const actx = pluginCtx?.sessions?.scope?.(sessionId);
+      const input = actx === undefined || actx === null ? undefined : pluginCtx?.conversation?.input?.for?.(actx);
+      const snapshot = input?.draftSnapshot;
+      if (snapshot === undefined || snapshot === null || typeof snapshot.text !== 'string') return false;
+
+      const marker = buildMarker(messageId);
+      const added = `${marker}\n`;
+      const chip = {
+        source: CHIP_SOURCE,
+        ref: messageId,
+        offset: 0,
+        length: marker.length,
+        label: `引用 ${messageId.slice(0, 8)}`,
+        clipboardText: marker
+      };
+      const references = (Array.isArray(snapshot.references) ? snapshot.references : [])
+        .map((reference) => ({ ...reference, offset: reference.offset + added.length }));
+      references.push(chip);
+      references.sort((a, b) => a.offset - b.offset);
+
+      input.setDraft({ text: added + snapshot.text, references });
+      return true;
+    }
+
+    /**
      * Remember which DOM row a message occupies.
      *
      * Stores the row anchor AND its turn id. The row is NOT a whole message: a
@@ -673,13 +728,26 @@ window.__ModuleLoader__.load({
         // A bare `[引用消息 <id>]` failed in real use: the model decided it did
         // not need the content and answered from memory (measured 0 calls across
         // 3 quotes). Quoting means "look at this", so the marker now says so.
-        const marker = `[引用消息 ${messageId}——请先调用 quote_read 读取全文，再回答]`;
+        const marker = buildMarker(messageId);
         setBusy(true);
         let inserted = false;
+        let usedChip = false;
         try {
-          inserted = actions.insertText(`${marker}\n`, actions.captureInsertion());
-        } catch {
+          inserted = insertQuoteChip(messageId, sessionId);
+          usedChip = inserted;
+        } catch (error) {
+          postLog('chip-insert-failed', { messageId, detail: String((error && error.message) || error) });
           inserted = false;
+        }
+        if (!inserted) {
+          // Fallback: plain text. The chip is nicer presentation, not a
+          // requirement — quoting must keep working even if the draft API
+          // behaves differently on another DSH build.
+          try {
+            inserted = actions.insertText(`${marker}\n`, actions.captureInsertion());
+          } catch {
+            inserted = false;
+          }
         }
         setBusy(false);
         if (inserted !== true) {
@@ -687,28 +755,25 @@ window.__ModuleLoader__.load({
           return;
         }
 
-        // The marker lands at the caret, so anything already typed ends up ABOVE
-        // it — and DSH renders nodes in text order, which puts the card below the
-        // user's own words. Move the marker to the top of the draft instead.
-        //
-        // Only when the draft carries no reference chips: shifting text under a
-        // chip would corrupt its offset. Best-effort — if the draft API is not
-        // reachable, the marker simply stays where it was inserted.
-        try {
-          const actx = pluginCtx?.sessions?.scope?.(sessionId);
-          const input = actx === undefined || actx === null ? undefined : pluginCtx?.conversation?.input?.for?.(actx);
-          const snapshot = input?.draftSnapshot;
-          const noChips = Array.isArray(snapshot?.references) && snapshot.references.length === 0;
-          if (noChips && typeof snapshot.text === 'string') {
-            const index = snapshot.text.lastIndexOf(marker);
-            const before = index > 0 ? snapshot.text.slice(0, index).replace(/\s+$/, '') : '';
-            if (index > 0 && before.length > 0) {
-              const after = snapshot.text.slice(index + marker.length);
-              input.setDraft({ text: `${marker}\n${before}${after}`, references: [] });
+        // Only the plain-text fallback needs reordering; a chip is written at
+        // offset 0 directly, and shifting text afterwards would corrupt it.
+        if (!usedChip) {
+          try {
+            const actx = pluginCtx?.sessions?.scope?.(sessionId);
+            const input = actx === undefined || actx === null ? undefined : pluginCtx?.conversation?.input?.for?.(actx);
+            const snapshot = input?.draftSnapshot;
+            const noChips = Array.isArray(snapshot?.references) && snapshot.references.length === 0;
+            if (noChips && typeof snapshot.text === 'string') {
+              const index = snapshot.text.lastIndexOf(marker);
+              const before = index > 0 ? snapshot.text.slice(0, index).replace(/\s+$/, '') : '';
+              if (index > 0 && before.length > 0) {
+                const after = snapshot.text.slice(index + marker.length);
+                input.setDraft({ text: `${marker}\n${before}${after}`, references: [] });
+              }
             }
+          } catch {
+            report('reorder-skipped', { messageId });
           }
-        } catch {
-          report('reorder-skipped', { messageId });
         }
 
         // Record the id -> session pair before the marker leaves the client, so
@@ -1139,6 +1204,27 @@ window.__ModuleLoader__.load({
       pluginCtx = ctx;
       ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'quote-shot: dictionaries');
 
+      // The composer chip. It never offers completion candidates — it exists so
+      // the draft can carry a reference this plugin owns, which DSH draws as a
+      // compact tag instead of the raw instruction line.
+      ctx.effect(
+        () =>
+          ctx.inputTriggers.registerSource({
+            trigger: '@',
+            name: CHIP_SOURCE,
+            order: 99,
+            showGroupTitle: false,
+            candidates: () => Promise.resolve([]),
+            onPick: () => undefined,
+            openReference: () => undefined,
+            codec: {
+              clipboardText: (ref) => buildMarker(String(ref)),
+              serialize: (ref) => Promise.resolve(buildMarker(String(ref)))
+            }
+          }),
+        'quote-shot: chip source'
+      );
+
       // Sent bubble: the marker becomes a card instead of a run of grey text.
       ctx.effect(() => ctx.uiConversation.userText.register(quoteRule), 'quote-shot: user-text rule');
       ctx.slots.inject('conversation.user.text.node', () =>
@@ -1179,7 +1265,7 @@ window.__ModuleLoader__.load({
     }
 
     exports.apply = apply;
-    exports.inject = ['slots', 'locale', 'uiConversation', 'conversation', 'sessions'];
+    exports.inject = ['slots', 'locale', 'uiConversation', 'conversation', 'sessions', 'inputTriggers'];
     exports.QuoteActions = QuoteActions;
     exports.QuoteCard = QuoteCard;
     exports.SentQuoteCard = SentQuoteCard;

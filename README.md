@@ -117,7 +117,7 @@ ctx.tools.register({
 })
 ```
 
-### 引用功能本身的六个坑
+### 引用功能本身的七个坑
 
 | # | 坑 | 后果 | 教训 |
 |---|---|---|---|
@@ -127,6 +127,43 @@ ctx.tools.register({
 | 4 | DOM 提取深度只到 6 | 找不到正文 | 没看过真实 DOM 就别猜深度 |
 | 5 | 「第一个够长就返回」 | 抓到路径碎片（87 字） | 取**最外层**候选，不是最近的 |
 | 6 | 用 `useInput` 的 `phase` 判断发送 | 那个字段不存在 | **未验证的 API 假设 = 建在沙子上** |
+| 7 | **`innerText ?? textContent`** | **0.2.2 后引用全空** | 见下，这是最隐蔽的一个 |
+
+### ⚠️ 坑 7 展开：`innerText` 对未渲染元素返回 `""`，不是 `null`
+
+**现象**：升级到 DSH 0.2.2 后，引用按钮还在、点击也有响应，但**每次都报 `no-text`**，日志里关键一行是：
+
+```json
+{"tag":"div","cls":"V4vHZW_flowItem","prevTag":"div","prevCls":"BE0jCW_root","prevTextLen":0}
+```
+
+`prevTextLen: 0` —— 前兄弟节点**存在于 DOM，但读出来是空的**。
+
+**根因**：0.2.2 对消息列表做了**虚拟化**，缓存区里的消息节点**在 DOM 里但不渲染**。此时：
+
+```js
+el.innerText      // → ""      （空字符串，不是 null！）
+el.textContent    // → "正文…"  （不依赖渲染，读得到）
+```
+
+而这段兜底代码**永远不会生效**：
+
+```js
+String(clone.innerText ?? clone.textContent ?? '')   // ❌ "" 不触发 ??
+```
+
+因为 **`??` 只在 `null` / `undefined` 时回退**，空字符串不触发。
+
+**正确写法**（显式判断长度）：
+
+```js
+const rendered = clone.innerText;
+const text = (rendered === undefined || rendered === null || rendered.length === 0)
+  ? String(clone.textContent ?? '')
+  : String(rendered);
+```
+
+**给所有写 DSH 客户端插件的人**：任何从消息 DOM 读文本的地方，**不要用 `innerText ?? textContent`**。0.2.2 之后消息会被虚拟化，未渲染节点的 `innerText` 是空字符串。
 
 ### 贯穿全局的一条
 

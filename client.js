@@ -173,7 +173,15 @@ window.__ModuleLoader__.load({
       try {
         const clone = element.cloneNode(true);
         for (const el of clone.querySelectorAll('button,[role="button"],svg,[data-quote-shot="action"]')) el.remove();
-        return String(clone.innerText ?? clone.textContent ?? '')
+        // `||`, NOT `??`. innerText returns "" (not null) when the element is
+        // not rendered — which is exactly what happens once the host virtualises
+        // or collapses message bodies: the node is in the DOM but invisible.
+        // `??` never falls through on "", so every quote came back empty.
+        const rendered = clone.innerText;
+        const fallback = rendered === undefined || rendered === null || rendered.length === 0
+          ? String(clone.textContent ?? '')
+          : String(rendered);
+        return fallback
           .replace(/\n{3,}/g, '\n\n')
           .trim();
       } catch {

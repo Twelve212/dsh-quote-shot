@@ -174,16 +174,40 @@ window.__ModuleLoader__.load({
     /**
      * Remember which DOM row a message occupies.
      *
+     * Stores the row anchor AND its turn id. The row is NOT a whole message: a
+     * reply is several rows (text, tool cards, file-change card) and the quote
+     * button lives in the LAST one, so highlighting just that row framed the
+     * file card instead of the answer. The turn id lets the jump widen to the
+     * whole exchange.
+     *
      * @param messageId - quoted message id.
      * @param row - the message row element.
      */
     function rememberAnchor(messageId, row) {
       const key = row?.getAttribute?.('data-chat-anchor-key');
       if (typeof key !== 'string' || key.length === 0) return;
+      const turn = row?.getAttribute?.('data-chat-turn') ?? null;
+      // One diagnostic shot of the ancestor chain: it is the only way to learn
+      // which level actually wraps a whole message on this DSH build.
+      try {
+        const chain = [];
+        let node = row;
+        for (let depth = 0; depth < 8 && node !== null; depth += 1) {
+          const attrs = [];
+          for (const attr of node.attributes ?? []) {
+            if (attr.name.startsWith('data-chat')) attrs.push(`${attr.name.replace('data-chat-', '')}=${String(attr.value).slice(0, 24)}`);
+          }
+          chain.push(`${node.tagName?.toLowerCase()}[${attrs.join(',')}]`);
+          node = node.parentElement;
+        }
+        report('anchor-chain', { key: key.slice(0, 24), turn, chain });
+      } catch {
+        /* diagnostics never break the click */
+      }
       try {
         const all = JSON.parse(localStorage.getItem(ANCHOR_STORE) ?? '{}');
         delete all[messageId];
-        all[messageId] = key;
+        all[messageId] = { key, turn };
         const ids = Object.keys(all);
         for (const stale of ids.slice(0, Math.max(0, ids.length - ANCHOR_LIMIT))) delete all[stale];
         localStorage.setItem(ANCHOR_STORE, JSON.stringify(all));
@@ -195,14 +219,18 @@ window.__ModuleLoader__.load({
     /**
      * The recorded row anchor for a message.
      *
+     * Tolerates the older plain-string format.
+     *
      * @param messageId - quoted message id.
-     * @returns the anchor key, or null.
+     * @returns `{ key, turn }`, or null.
      */
     function anchorFor(messageId) {
       try {
         const all = JSON.parse(localStorage.getItem(ANCHOR_STORE) ?? '{}');
-        const key = all[messageId];
-        return typeof key === 'string' ? key : null;
+        const value = all[messageId];
+        if (typeof value === 'string') return { key: value, turn: null };
+        if (value !== null && typeof value === 'object' && typeof value.key === 'string') return value;
+        return null;
       } catch {
         return null;
       }
@@ -211,31 +239,48 @@ window.__ModuleLoader__.load({
     /**
      * Scroll to a quoted message and flash it.
      *
-     * Messages the virtualised list has not rendered are not in the DOM at all;
-     * there is no honest way to jump to them, so this reports "not on screen"
-     * instead of inventing a scroll.
+     * Highlights the whole turn when the turn id is known, otherwise the row
+     * itself. Messages the virtualised list has not rendered are not in the DOM
+     * at all; there is no honest way to jump to them, so this reports "not on
+     * screen" instead of inventing a scroll.
      *
      * @param messageId - quoted message id.
-     * @returns true when the row was found and scrolled to.
+     * @returns true when something was found and scrolled to.
      */
     function jumpToMessage(messageId) {
-      const key = anchorFor(messageId);
-      if (key === null) return false;
+      const record = anchorFor(messageId);
+      if (record === null) return false;
       let row = null;
       try {
-        row = document.querySelector(`[data-chat-anchor-key="${CSS.escape(key)}"]`);
+        row = document.querySelector(`[data-chat-anchor-key="${CSS.escape(record.key)}"]`);
       } catch {
         row = null;
       }
       if (row === null) return false;
-      row.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      const previousOutline = row.style.outline;
-      const previousOffset = row.style.outlineOffset;
-      row.style.outline = '2px solid #4d6bfe';
-      row.style.outlineOffset = '2px';
+
+      // Widen to the exchange: the anchor row is only the last block of the
+      // message (often a tool or file-change card), not the message itself.
+      let target = row;
+      if (record.turn !== null) {
+        try {
+          const scoped = row.closest(`[data-chat-turn="${CSS.escape(record.turn)}"]`);
+          if (scoped !== null) target = scoped;
+        } catch {
+          /* keep the row */
+        }
+      }
+
+      target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      const previousOutline = target.style.outline;
+      const previousOffset = target.style.outlineOffset;
+      const previousRadius = target.style.borderRadius;
+      target.style.outline = '2px solid #4d6bfe';
+      target.style.outlineOffset = '3px';
+      target.style.borderRadius = '10px';
       setTimeout(() => {
-        row.style.outline = previousOutline;
-        row.style.outlineOffset = previousOffset;
+        target.style.outline = previousOutline;
+        target.style.outlineOffset = previousOffset;
+        target.style.borderRadius = previousRadius;
       }, 1500);
       return true;
     }

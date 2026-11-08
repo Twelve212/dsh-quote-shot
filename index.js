@@ -16,7 +16,7 @@ import { appendFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-import { readMessageById } from './session-reader.js';
+import { readMessageById, readMessageFromFile, listRecentSessionFiles } from './session-reader.js';
 
 /**
  * Diagnostic log path.
@@ -55,7 +55,44 @@ export const inject = ['webServer', 'agents', 'tools'];
 /** Route owned by this plugin. */
 const ROUTE = '/quote-shot/inject';
 
-/** Longest accepted quote body, so one call cannot flood the context. */
+/**
+ * Route where the client reports which session a quote id belongs to.
+ *
+ * This is the one piece of knowledge the Host cannot recover reliably: the
+ * click happens in a known session, but `quote_read` runs later with no session
+ * context at all. Remembering the click's sessionId turns "guess which live
+ * agent is calling" into a direct lookup.
+ */
+const HINT_ROUTE = '/quote-shot/hint';
+
+/**
+ * messageId -> sessionId, filled by the client when a quote is placed.
+ *
+ * Bounded: a long session can quote many messages, and only recent quotes are
+ * plausibly still unread. Oldest entries fall out first (Map preserves order).
+ */
+const quoteHints = new Map();
+const MAX_HINTS = 200;
+
+/**
+ * Remember which session a quoted message belongs to.
+ *
+ * @param messageId - quoted message id.
+ * @param sessionId - session the quote button was clicked in.
+ */
+function rememberHint(messageId, sessionId) {
+  if (messageId.length === 0 || sessionId.length === 0) return;
+  quoteHints.delete(messageId);
+  quoteHints.set(messageId, sessionId);
+  if (quoteHints.size > MAX_HINTS) {
+    const oldest = quoteHints.keys().next().value;
+    quoteHints.delete(oldest);
+  }
+}
+
+/**
+ * Longest accepted quote body, so one call cannot flood the context.
+ */
 const MAX_TEXT_CHARS = 20_000;
 /** Longest accepted summary line shown in the collapsed row. */
 const MAX_SUMMARY_CHARS = 200;
@@ -232,6 +269,44 @@ export function apply(ctx) {
     'quote-shot: client log route'
   );
 
+  // Client hint sink: which session the quote was placed in.
+  //
+  // Fire-and-forget from the client. A missed hint only costs a slower lookup
+  // (the registry and the on-disk scan still run), so failures are silent.
+  ctx.effect(
+    () =>
+      ctx.webServer.register({
+        kind: 'exact',
+        path: HINT_ROUTE,
+        handler: async (request, response) => {
+          const reply = (status, body) => {
+            response.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+            response.end(JSON.stringify(body));
+          };
+          if (request.method !== 'POST') {
+            response.writeHead(405, { allow: 'POST' });
+            response.end();
+            return;
+          }
+          const body = await readJson(request);
+          if (body === null) {
+            reply(400, { ok: false, code: 'bad-json' });
+            return;
+          }
+          const messageId = typeof body.messageId === 'string' ? body.messageId.trim() : '';
+          const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : '';
+          if (messageId.length === 0 || sessionId.length === 0) {
+            reply(400, { ok: false, code: 'missing-fields' });
+            return;
+          }
+          rememberHint(messageId, sessionId);
+          trace(`hint message=${messageId} session=${sessionId}`);
+          reply(200, { ok: true });
+        }
+      }),
+    'quote-shot: hint route'
+  );
+
   // The `quote_read` tool: read a message's full text by id.
   //
   // This is what makes "quote by reference" possible — the composer carries only
@@ -295,25 +370,73 @@ export function apply(ctx) {
             const messageId = typeof args?.messageId === 'string' ? args.messageId.trim() : '';
             if (messageId.length === 0) return { found: false, messageId: '', error: 'missing-messageId' };
 
+            const startedAt = Date.now();
+            const tried = [];
+
+            // 1. The session the client reported when the quote was placed.
+            //    This is the exact answer, and it is the only step that works
+            //    when the caller is not the session that owns the message.
+            const hinted = quoteHints.get(messageId);
+            if (typeof hinted === 'string' && hinted.length > 0) {
+              tried.push(hinted);
+              const text = readMessageById(hinted, messageId);
+              if (text !== null) {
+                trace(`quote_read session=${hinted} message=${messageId} len=${text.length} via=hint`);
+                return { found: true, messageId, text };
+              }
+            }
+
+            // 2. Every live agent, newest first.
+            //
+            //    The previous version used ONLY the last registered agent. That
+            //    is wrong: Mnemon's idle checkpoint reviewer runs as a live
+            //    subagent, so "the last live agent" can be a background reviewer
+            //    session that has never seen the quoted message. Iterating all of
+            //    them costs one Map lookup per agent and removes the guess.
             let live = [];
             try {
               live = ctx.agents.list();
             } catch {
               live = [];
             }
-            if (live.length === 0) return { found: false, messageId, error: 'no-active-conversation' };
-
-            // Most recently registered live agent is the one issuing this call.
-            const owner = live[live.length - 1];
-            const sessionId = owner?.session?.id;
-            if (typeof sessionId !== 'string' || sessionId.length === 0) {
-              return { found: false, messageId, error: 'no-session-id' };
+            for (let index = live.length - 1; index >= 0; index -= 1) {
+              const sessionId = live[index]?.session?.id;
+              if (typeof sessionId !== 'string' || sessionId.length === 0) continue;
+              if (tried.includes(sessionId)) continue;
+              tried.push(sessionId);
+              const text = readMessageById(sessionId, messageId);
+              if (text !== null) {
+                trace(`quote_read session=${sessionId} message=${messageId} len=${text.length} via=live`);
+                return { found: true, messageId, text };
+              }
             }
 
-            const text = readMessageById(sessionId, messageId);
-            if (text === null) return { found: false, messageId, error: 'not-found' };
-            trace(`quote_read session=${sessionId} message=${messageId} len=${text.length}`);
-            return { found: true, messageId, text };
+            // 3. On-disk scan of the most recently used logs.
+            //
+            //    Covers the case no registry can: DSH restarted, or the quoted
+            //    message belongs to a conversation that is no longer live. Message
+            //    ids are UUIDs, so a hit is unambiguous.
+            let sources = [];
+            try {
+              sources = listRecentSessionFiles(25);
+            } catch {
+              sources = [];
+            }
+            for (const source of sources) {
+              const text = readMessageFromFile(source.file, messageId);
+              if (text !== null) {
+                trace(`quote_read session=${source.sessionId} message=${messageId} len=${text.length} via=scan`);
+                return { found: true, messageId, text };
+              }
+            }
+
+            // Failure MUST be traced. Silently returning `not-found` is exactly
+            // how this bug stayed invisible: the UI showed a message it could not
+            // find, and the log had nothing.
+            trace(
+              `quote_read MISS message=${messageId} tried=[${tried.join(', ')}] scanned=${sources.length} ms=${Date.now() - startedAt}`
+            );
+            return { found: false, messageId, error: 'not-found' };
           }
         });
         trace('tool quote_read registered');

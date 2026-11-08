@@ -42,6 +42,8 @@ window.__ModuleLoader__.load({
     const CARD_PREVIEW_CHARS = 60;
     /** Host route that performs the injection. */
     const INJECT_ROUTE = '/quote-shot/inject';
+    /** Host route where the click's session is reported for `quote_read`. */
+    const HINT_ROUTE = '/quote-shot/hint';
 
     //#region quote state
     /**
@@ -107,6 +109,31 @@ window.__ModuleLoader__.load({
           credentials: 'same-origin',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ stage, detail: detail ?? null })
+        }).catch(() => {});
+      } catch {
+        /* ignored on purpose */
+      }
+    }
+    /**
+     * Tell the Host which session this quote id belongs to.
+     *
+     * `quote_read` runs later with no session context, and the live-agent
+     * registry cannot be trusted to point at the caller (background subagents
+     * are live agents too). The click is the one moment the id and the session
+     * are both known, so it is recorded here.
+     *
+     * Fire-and-forget: a lost hint only costs the Host a slower fallback lookup.
+     *
+     * @param messageId - the quoted message id.
+     * @param sessionId - the session the button was clicked in.
+     */
+    function postHint(messageId, sessionId) {
+      try {
+        fetch(HINT_ROUTE, {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ messageId, sessionId })
         }).catch(() => {});
       } catch {
         /* ignored on purpose */
@@ -440,6 +467,10 @@ window.__ModuleLoader__.load({
           report('insert-failed', { messageId });
           return;
         }
+
+        // Record the id -> session pair before the marker leaves the client, so
+        // `quote_read` can resolve the owner instead of guessing a live agent.
+        postHint(messageId, sessionId);
 
         replaceQuote(sessionId, {
           id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,

@@ -255,33 +255,25 @@ window.__ModuleLoader__.load({
      */
     function jumpToMessage(messageId) {
       const record = anchorFor(messageId);
-      if (record === null) return false;
+      if (record === null) {
+        postLog('jump-miss', { messageId, reason: 'no-anchor' });
+        return false;
+      }
 
-      // Anchor keys look like `9:turn-tail1` — `<turn>:<part>`. The row we
-      // recorded is the turn's TAIL (that is where message actions live), so
-      // jumping to it framed the last block of the reply instead of the reply.
-      // Jump to the first row sharing the turn prefix instead.
-      const key = record.key;
-      const colon = key.indexOf(':');
-      const prefix = colon > 0 ? key.slice(0, colon + 1) : null;
-
+      // Back to the behaviour that demonstrably worked: find the recorded row
+      // verbatim. The turn-prefix widening is gone until the row it lands on is
+      // understood; a broken jump is worse than an imprecise one.
       let row = null;
-      if (prefix !== null) {
-        try {
-          const group = document.querySelectorAll(`[data-chat-anchor-key^="${prefix}"]`);
-          if (group.length > 0) row = group[0];
-        } catch {
-          row = null;
-        }
+      try {
+        row = document.querySelector(`[data-chat-anchor-key="${CSS.escape(record.key)}"]`);
+      } catch (error) {
+        postLog('jump-miss', { messageId, reason: 'selector-error', detail: String((error && error.message) || error) });
+        return false;
       }
       if (row === null) {
-        try {
-          row = document.querySelector(`[data-chat-anchor-key="${CSS.escape(key)}"]`);
-        } catch {
-          row = null;
-        }
+        postLog('jump-miss', { messageId, reason: 'row-gone', key: record.key });
+        return false;
       }
-      if (row === null) return false;
 
       row.scrollIntoView({ behavior: 'smooth', block: 'center' });
       const previousOutline = row.style.outline;
@@ -295,6 +287,7 @@ window.__ModuleLoader__.load({
         row.style.outlineOffset = previousOffset;
         row.style.borderRadius = previousRadius;
       }, 1500);
+      postLog('jump-ok', { messageId, key: record.key });
       return true;
     }
 

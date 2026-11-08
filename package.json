@@ -1,6 +1,6 @@
 {
   "name": "dsh-quote-shot",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Quote a whole DSH message by reference: the composer carries only a message id, and the model reads the full text on demand through a quote_read tool instead of pasting it into the prompt.",
   "type": "module",
   "main": "index.js",

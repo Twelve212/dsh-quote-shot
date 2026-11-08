@@ -157,6 +157,89 @@ window.__ModuleLoader__.load({
      * @param anchor - the clicked button element.
      * @returns the text, or an empty string when nothing usable was found.
      */
+    /**
+     * Where a quoted message was on screen, keyed by message id.
+     *
+     * DSH's message DOM carries no message id — only `data-chat-anchor-key` — so
+     * a message id alone cannot find its row. The one moment the row IS known is
+     * the quote click, because the button lives inside it; the row's anchor is
+     * recorded then and replayed later.
+     *
+     * Global rather than per-session: ids are UUIDs so they cannot collide, and
+     * the sent-message card has no session id available.
+     */
+    const ANCHOR_STORE = 'dsh-quote-shot:anchors';
+    const ANCHOR_LIMIT = 200;
+
+    /**
+     * Remember which DOM row a message occupies.
+     *
+     * @param messageId - quoted message id.
+     * @param row - the message row element.
+     */
+    function rememberAnchor(messageId, row) {
+      const key = row?.getAttribute?.('data-chat-anchor-key');
+      if (typeof key !== 'string' || key.length === 0) return;
+      try {
+        const all = JSON.parse(localStorage.getItem(ANCHOR_STORE) ?? '{}');
+        delete all[messageId];
+        all[messageId] = key;
+        const ids = Object.keys(all);
+        for (const stale of ids.slice(0, Math.max(0, ids.length - ANCHOR_LIMIT))) delete all[stale];
+        localStorage.setItem(ANCHOR_STORE, JSON.stringify(all));
+      } catch {
+        /* storage is best-effort; jumping just degrades */
+      }
+    }
+
+    /**
+     * The recorded row anchor for a message.
+     *
+     * @param messageId - quoted message id.
+     * @returns the anchor key, or null.
+     */
+    function anchorFor(messageId) {
+      try {
+        const all = JSON.parse(localStorage.getItem(ANCHOR_STORE) ?? '{}');
+        const key = all[messageId];
+        return typeof key === 'string' ? key : null;
+      } catch {
+        return null;
+      }
+    }
+
+    /**
+     * Scroll to a quoted message and flash it.
+     *
+     * Messages the virtualised list has not rendered are not in the DOM at all;
+     * there is no honest way to jump to them, so this reports "not on screen"
+     * instead of inventing a scroll.
+     *
+     * @param messageId - quoted message id.
+     * @returns true when the row was found and scrolled to.
+     */
+    function jumpToMessage(messageId) {
+      const key = anchorFor(messageId);
+      if (key === null) return false;
+      let row = null;
+      try {
+        row = document.querySelector(`[data-chat-anchor-key="${CSS.escape(key)}"]`);
+      } catch {
+        row = null;
+      }
+      if (row === null) return false;
+      row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      const previousOutline = row.style.outline;
+      const previousOffset = row.style.outlineOffset;
+      row.style.outline = '2px solid #4d6bfe';
+      row.style.outlineOffset = '2px';
+      setTimeout(() => {
+        row.style.outline = previousOutline;
+        row.style.outlineOffset = previousOffset;
+      }, 1500);
+      return true;
+    }
+
     function readQuoteText(anchor) {
       try {
         const selection = window.getSelection();
@@ -433,6 +516,10 @@ window.__ModuleLoader__.load({
         }
 
         const text = readQuoteText(event.currentTarget);
+        // Record which row this message occupies: the message DOM carries no
+        // message id, and the sent card needs a way back. Done here because the
+        // button sits inside that row.
+        rememberAnchor(messageId, event.currentTarget.closest('[data-chat-anchor-key]'));
         if (text.length === 0) {
           // Ship the DOM shape along with the failure: message markup is not a
           // contract, so the extraction strategy cannot be fixed from a bare
@@ -780,6 +867,7 @@ window.__ModuleLoader__.load({
       const [open, setOpen] = react.useState(false);
       const [body, setBody] = react.useState(null);
       const [state, setState] = react.useState('idle');
+      const [notice, setNotice] = react.useState(null);
 
       const toggle = async () => {
         if (open) {
@@ -811,38 +899,66 @@ window.__ModuleLoader__.load({
       };
 
       const shortId = messageId.slice(0, 8);
-      const children = [];
 
-      children.push(
+      const jump = () => {
+        if (jumpToMessage(messageId)) return;
+        // The row is gone: the virtualised list dropped it, or the page reloaded
+        // before any anchor was recorded for this id.
+        setNotice('原消息不在当前视图');
+        setTimeout(() => setNotice(null), 2200);
+      };
+
+      const header = h(
+        'span',
+        {
+          role: 'button',
+          tabIndex: 0,
+          onClick: jump,
+          onKeyDown: (event) => {
+            if (event.key === 'Enter' || event.key === ' ') {
+              event.preventDefault();
+              jump();
+            }
+          },
+          title: '点击回到原消息',
+          style: {
+            display: 'flex',
+            alignItems: 'center',
+            gap: '6px',
+            padding: '3px 8px',
+            borderRadius: 'var(--dsw-radius-sm, 6px)',
+            cursor: 'pointer',
+            fontSize: '12px',
+            lineHeight: '16px',
+            color: 'color-mix(in srgb, currentColor 58%, transparent)'
+          }
+        },
+        h('span', { 'aria-hidden': 'true' }, '\u275D'),
+        h('span', null, `引用 ${shortId}`),
+        notice !== null ? h('span', { style: { opacity: 0.85 } }, notice) : null,
         h(
           'span',
           {
-            key: 'head',
-            style: {
-              display: 'flex',
-              alignItems: 'center',
-              gap: '6px',
-              fontSize: '12px',
-              lineHeight: '16px',
-              color: 'color-mix(in srgb, currentColor 58%, transparent)'
-            }
-          },
-          h('span', { 'aria-hidden': 'true' }, '\u275D'),
-          h('span', null, `引用 ${shortId}`),
-          h(
-            'span',
-            {
-              key: 'toggle',
-              style: {
-                // Push the action to the right edge of the card.
-                marginLeft: 'auto',
-                opacity: 0.6
+            role: 'button',
+            tabIndex: 0,
+            onClick: (event) => {
+              event.stopPropagation();
+              toggle();
+            },
+            onKeyDown: (event) => {
+              if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault();
+                event.stopPropagation();
+                toggle();
               }
             },
-            open ? '收起' : state === 'loading' ? '读取中…' : '展开'
-          )
+            style: { marginLeft: 'auto', opacity: 0.7, cursor: 'pointer' }
+          },
+          open ? '收起' : state === 'loading' ? '读取中…' : '展开'
         )
       );
+
+      const children = [header];
 
       if (open) {
         children.push(
@@ -853,6 +969,7 @@ window.__ModuleLoader__.load({
               style: {
                 display: 'block',
                 marginTop: '6px',
+                padding: '0 8px 4px',
                 maxHeight: '220px',
                 overflowY: 'auto',
                 whiteSpace: 'pre-wrap',
@@ -870,23 +987,12 @@ window.__ModuleLoader__.load({
       return h(
         'span',
         {
-          role: 'button',
-          tabIndex: 0,
-          onClick: toggle,
-          onKeyDown: (event) => {
-            if (event.key === 'Enter' || event.key === ' ') {
-              event.preventDefault();
-              toggle();
-            }
-          },
           style: {
             display: 'block',
             margin: '2px 0 6px',
-            padding: '3px 8px',
             borderLeft: '2px solid color-mix(in srgb, currentColor 35%, transparent)',
             borderRadius: 'var(--dsw-radius-sm, 6px)',
             background: 'color-mix(in srgb, currentColor 6%, transparent)',
-            cursor: 'pointer',
             userSelect: 'text'
           }
         },

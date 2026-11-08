@@ -294,7 +294,9 @@ window.__ModuleLoader__.load({
           'z-index:2147483000',
           `left:${rect.left + rect.width * 0.06}px`,
           `width:${rect.width * 0.88}px`,
-          `top:${y - 2}px`,
+          // Lifted off the row's bottom edge: sitting flush against it made the
+          // line read as the divider of the NEXT message.
+          `top:${y - 9}px`,
           'height:3px',
           'border-radius:2px',
           'background:linear-gradient(90deg,transparent 0%,#4d6bfe 18%,#4d6bfe 82%,transparent 100%)',

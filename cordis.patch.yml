@@ -1,0 +1,7 @@
+# dsh-quote-shot —— bundle 挂载声明
+#
+# 必须用 insert 行：裸的 `- id: ...` + `name:` 会被 patch 算法当成
+# 「对不存在 id 的覆盖」而静默跳过（2026-09-30 鲸鱼娘插件踩过这个坑）。
+- insert:
+    - id: quote-shot
+      name: dsh-quote-shot

@@ -1,0 +1,38 @@
+{
+  "name": "dsh-quote-shot",
+  "version": "0.1.0",
+  "description": "Quote a whole DSH message by reference: the composer carries only a message id, and the model reads the full text on demand through a quote_read tool instead of pasting it into the prompt.",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    },
+    "compatibility": {
+      "dsh": ">=0.2.1-rc.1",
+      "node": ">=20"
+    }
+  },
+  "keywords": [
+    "dsh-plugin",
+    "dsh",
+    "deepseek-harness",
+    "quote",
+    "reference",
+    "context"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Twelve212/dsh-quote-shot.git"
+  },
+  "author": "Twelve212",
+  "license": "MIT"
+}

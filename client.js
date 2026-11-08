@@ -1,0 +1,716 @@
+/**
+ * dsh-quote-shot — browser (client) half.
+ *
+ * Quoting injects a collapsed context row into the session instead of pasting
+ * the message into the composer. The Host owns the injection (`POST
+ * /quote-shot/inject`); this half only:
+ *   - puts a quote icon on every assistant message
+ *   - shows one-line quote cards above the composer
+ *
+ * The composer stays clean, and the model still receives the full quoted text.
+ */
+
+window.__ModuleLoader__.load({
+  id: 'dsh-quote-shot',
+  factory: (require) => {
+    var module = { exports: {} };
+    var exports = module.exports;
+    Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' });
+
+    const react = require('react');
+    const h = react.createElement;
+
+    /** Locale namespace this plugin owns. */
+    const NS = 'quoteShot';
+
+    const zh = {
+      title: '引用',
+      remove: '移除这条引用标记',
+      empty: '没找到可引用的文字',
+      failed: '引用失败，请重试'
+    };
+    const en = {
+      title: 'Quote',
+      remove: 'Remove this quote marker',
+      empty: 'Nothing to quote',
+      failed: 'Quote failed, try again'
+    };
+
+    /** Longest quoted excerpt sent as context. */
+    const MAX_QUOTE_CHARS = 4000;
+    /** Characters shown in the card's single preview line. */
+    const CARD_PREVIEW_CHARS = 60;
+    /** Host route that performs the injection. */
+    const INJECT_ROUTE = '/quote-shot/inject';
+
+    //#region quote state
+    /**
+     * Per-session list of quotes, newest last.
+     *
+     * A tiny external store keeps the action row and the composer cards in sync.
+     */
+    const quoteState = new Map();
+    const listeners = new Set();
+
+    function emit() {
+      for (const listener of listeners) listener();
+    }
+
+    function listQuotes(sessionId) {
+      return quoteState.get(sessionId) ?? [];
+    }
+
+    /**
+     * Replace this session's cards with a single new one.
+     *
+     * A quote is consumed by exactly one send, so keeping a growing list is
+     * wrong: the card is a receipt for the pending quote, not a history. This
+     * also guarantees the UI cannot accumulate stale cards even if the
+     * send-completion signal is unavailable.
+     */
+    function replaceQuote(sessionId, quote) {
+      quoteState.set(sessionId, [quote]);
+      emit();
+    }
+
+    function addQuote(sessionId, quote) {
+      quoteState.set(sessionId, [...listQuotes(sessionId), quote]);
+      emit();
+    }
+
+    function removeQuote(sessionId, id) {
+      quoteState.set(
+        sessionId,
+        listQuotes(sessionId).filter((item) => item.id !== id)
+      );
+      emit();
+    }
+
+    function subscribe(listener) {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    }
+
+    /**
+     * Send a client-side diagnostic line to the Host log.
+     *
+     * Fire-and-forget by design: a diagnostic that can throw or block would be
+     * worse than none. Best-effort, never awaited.
+     *
+     * @param stage - which step reported.
+     * @param detail - extra context worth keeping.
+     */
+    function postLog(stage, detail) {
+      try {
+        fetch('/quote-shot/log', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ stage, detail: detail ?? null })
+        }).catch(() => {});
+      } catch {
+        /* ignored on purpose */
+      }
+    }
+    //#endregion
+
+    /**
+     * Read the text to quote.
+     *
+     * Prefers the live selection. Otherwise walks UP from the action button and
+     * takes the FIRST previous sibling that holds a body of text.
+     *
+     * That sibling walk is deliberate: climbing ancestors instead would swallow
+     * the whole turn — user message plus assistant reply — and the first long
+     * text found is usually the USER's question, which is the wrong thing to
+     * quote. The action row's preceding sibling is this message's own body.
+     *
+     * @param anchor - the clicked button element.
+     * @returns the text, or an empty string when nothing usable was found.
+     */
+    function readQuoteText(anchor) {
+      try {
+        const selection = window.getSelection();
+        if (selection !== null && selection.isCollapsed === false) {
+          const picked = String(selection).trim();
+          if (picked.length > 0) return picked;
+        }
+      } catch {
+        /* a denied selection read falls through to the DOM path */
+      }
+
+      // Walk all the way out and keep the OUTERMOST usable sibling.
+      //
+      // Measured on the real DOM: the action row sits inside
+      // `div.actions > div.root > div > div`, and the message body is the
+      // previous sibling of the outer `flowItem` (depth 7). But a message can
+      // contain small blocks of its own — a file-path chip, an inline code
+      // fragment — which sit at shallower depths and are already "long enough".
+      // Returning the first hit grabbed exactly those (measured: an 87-character
+      // path instead of the 897-character message). So keep walking and let the
+      // outer one win.
+      let node = anchor;
+      let candidate = '';
+      for (let depth = 0; depth < 12 && node !== null && node !== undefined; depth += 1) {
+        const previous = node.previousElementSibling;
+        if (previous !== null && previous !== undefined) {
+          const text = textOf(previous);
+          // A body is substantially longer than a label or an icon row.
+          if (text.length >= 12) candidate = text;
+        }
+        node = node.parentElement;
+      }
+      return candidate;
+    }
+
+    /**
+     * Text content of one element with all interactive chrome removed.
+     *
+     * @param element - the element to read.
+     * @returns trimmed text with buttons and icons stripped.
+     */
+    function textOf(element) {
+      try {
+        const clone = element.cloneNode(true);
+        for (const el of clone.querySelectorAll('button,[role="button"],svg,[data-quote-shot="action"]')) el.remove();
+        return String(clone.innerText ?? clone.textContent ?? '')
+          .replace(/\n{3,}/g, '\n\n')
+          .trim();
+      } catch {
+        return '';
+      }
+    }
+
+    /**
+     * Describe the DOM around a clicked button, for diagnostics.
+     *
+     * Message markup is not a published contract, so when text extraction fails
+     * there is nothing to reason about without seeing the actual ancestor chain.
+     * This records tags, class names, text lengths and previous siblings — just
+     * enough to work the extraction strategy out from a log line.
+     *
+     * @param anchor - the clicked button.
+     * @returns the ancestor chain, outermost last.
+     */
+    function describeDom(anchor) {
+      const chain = [];
+      let node = anchor;
+      for (let depth = 0; depth < 8 && node !== null && node !== undefined; depth += 1) {
+        let previous = null;
+        try {
+          previous = node.previousElementSibling;
+        } catch {
+          previous = null;
+        }
+        const text = String(node.innerText ?? node.textContent ?? '');
+        const previousText = previous === null ? '' : String(previous.innerText ?? previous.textContent ?? '');
+        chain.push({
+          tag: String(node.tagName ?? '?').toLowerCase(),
+          cls: String(node.className ?? '').slice(0, 60),
+          textLen: text.length,
+          prevTag: previous === null ? null : String(previous.tagName ?? '?').toLowerCase(),
+          prevCls: previous === null ? null : String(previous.className ?? '').slice(0, 60),
+          prevTextLen: previousText.length,
+          siblings: node.parentElement === null || node.parentElement === undefined ? 0 : node.parentElement.children.length
+        });
+        node = node.parentElement;
+      }
+      return chain;
+    }
+
+    /**
+     * Collapse text to the single preview line shown on the card.
+     *
+     * @param text - raw quoted text.
+     * @returns a one-line excerpt.
+     */
+    function previewOf(text) {
+      const flat = text.replace(/\s+/g, ' ').trim();
+      return flat.length > CARD_PREVIEW_CHARS ? `${flat.slice(0, CARD_PREVIEW_CHARS)}…` : flat;
+    }
+
+    /**
+     * Send the quote to the Host for context injection.
+     *
+     * @param sessionId - owning session.
+     * @param text - the quoted text.
+     * @returns the Host outcome; never throws.
+     */
+    async function injectQuote(sessionId, text) {
+      try {
+        const response = await fetch(INJECT_ROUTE, {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ sessionId, text: text.slice(0, MAX_QUOTE_CHARS) }),
+          signal: AbortSignal.timeout(15000)
+        });
+        const payload = await response.json().catch(() => null);
+        if (!response.ok || payload?.ok !== true) {
+          return { ok: false, code: String(payload?.code ?? response.status) };
+        }
+        return { ok: true };
+      } catch (error) {
+        return { ok: false, code: String((error && error.message) || error) };
+      }
+    }
+
+    /** The quote mark used instead of a text label. */
+    function QuoteIcon(props) {
+      const size = props?.size ?? 14;
+      return h(
+        'svg',
+        { width: String(size), height: String(size), viewBox: '0 0 16 16', fill: 'none', 'aria-hidden': 'true' },
+        h('path', {
+          d: 'M3.34 5.6c0-1.46.97-2.55 2.4-2.85v1.5c-.72.18-1.13.68-1.13 1.26h1.13v3.4H3.34V5.6Zm5.6 0c0-1.46.97-2.55 2.4-2.85v1.5c-.72.18-1.13.68-1.13 1.26h1.13v3.4H8.94V5.6Z',
+          fill: 'currentColor'
+        })
+      );
+    }
+
+    /** Hover delay before the tooltip appears. */
+    const TOOLTIP_DELAY_MS = 450;
+
+    /**
+     * A tooltip that follows the host's look.
+     *
+     * The built-in Tooltip component is not reachable from a third-party
+     * bundle (its package is not exposed to plugins), so this reimplements the
+     * observable behaviour: a short hover delay, a dark rounded pill, and fixed
+     * positioning so a scrolling container cannot clip it.
+     *
+     * @param props - `label` (text) and `children` (the anchor).
+     * @returns the anchor plus an optional fixed-position bubble.
+     */
+    function Tooltip(props) {
+      const label = props.label;
+      const [open, setOpen] = react.useState(false);
+      const [position, setPosition] = react.useState(null);
+      const timer = react.useRef(null);
+      const anchor = react.useRef(null);
+
+      const clear = () => {
+        if (timer.current !== null) {
+          clearTimeout(timer.current);
+          timer.current = null;
+        }
+      };
+
+      const onEnter = () => {
+        clear();
+        timer.current = setTimeout(() => {
+          const rect = anchor.current?.getBoundingClientRect?.();
+          if (rect === undefined || rect === null) return;
+          setPosition({ top: rect.bottom + 8, left: rect.left + rect.width / 2 });
+          setOpen(true);
+        }, TOOLTIP_DELAY_MS);
+      };
+
+      const onLeave = () => {
+        clear();
+        setOpen(false);
+      };
+
+      // A component unmounted mid-hover must not leave a timer behind.
+      react.useEffect(() => clear, []);
+
+      return h(
+        'span',
+        {
+          ref: anchor,
+          onMouseEnter: onEnter,
+          onMouseLeave: onLeave,
+          onFocus: onEnter,
+          onBlur: onLeave,
+          style: { display: 'inline-flex' }
+        },
+        props.children,
+        open && position !== null
+          ? h(
+              'span',
+              {
+                role: 'tooltip',
+                style: {
+                  position: 'fixed',
+                  top: `${position.top}px`,
+                  left: `${position.left}px`,
+                  transform: 'translateX(-50%)',
+                  background: 'var(--dsw-alias-bg-tooltip, rgba(28,28,30,0.92))',
+                  color: '#ffffff',
+                  fontSize: 'var(--dsw-font-xxs-12, 12px)',
+                  lineHeight: '18px',
+                  padding: '4px 8px',
+                  borderRadius: 'var(--dsw-radius-sm, 6px)',
+                  boxShadow: '0 4px 14px rgba(0,0,0,0.22)',
+                  whiteSpace: 'nowrap',
+                  pointerEvents: 'none',
+                  zIndex: 2147483000
+                }
+              },
+              label
+            )
+          : null
+      );
+    }
+
+    /**
+     * The quote button in every assistant message's action row.
+     *
+     * @param props - slot props; `sessionId` identifies the conversation.
+     * @returns the button element.
+     */
+    function QuoteActions(props) {
+      const t = typeof props.t === 'function' ? props.t : (key) => key;
+      const sessionId = props.sessionId;
+      const [busy, setBusy] = react.useState(false);
+      const [hover, setHover] = react.useState(false);
+      const [flash, setFlash] = react.useState(null);
+
+      /**
+       * Report a client-side failure to the Host log.
+       *
+       * Silent `return`s were the whole reason "clicking quote does nothing" was
+       * undiagnosable: the button just stopped. Every early exit reports now.
+       *
+       * @param stage - which step failed.
+       * @param detail - extra context.
+       */
+      const report = (stage, detail) => {
+        setFlash('✕');
+        setTimeout(() => setFlash(null), 1500);
+        postLog(stage, { ...(detail ?? {}), sessionId: sessionId ?? null });
+      };
+
+      const onClick = async (event) => {
+        if (busy) return;
+
+        // Quote-by-reference: nothing is injected at click time.
+        //
+        // The message text is still read from the DOM, but ONLY to fill the
+        // card preview — the session receives just a one-line marker. That is
+        // what makes the quote withdrawable: nothing has been written yet.
+        const messageId = props.messageId;
+        if (typeof messageId !== 'string' || messageId.length === 0) {
+          report('no-message-id', {});
+          return;
+        }
+
+        const text = readQuoteText(event.currentTarget);
+        if (text.length === 0) {
+          // Ship the DOM shape along with the failure: message markup is not a
+          // contract, so the extraction strategy cannot be fixed from a bare
+          // "nothing found".
+          report('no-text', { hasSelection: false, dom: describeDom(event.currentTarget) });
+          return;
+        }
+        if (sessionId === undefined) {
+          report('no-session-id', { textLen: text.length });
+          return;
+        }
+
+        const actions = props.inputActions;
+        if (actions === undefined || actions === null) {
+          report('no-input-actions', {});
+          return;
+        }
+
+        // Explicit instruction, not a bare marker.
+        //
+        // A bare `[引用消息 <id>]` failed in real use: the model decided it did
+        // not need the content and answered from memory (measured 0 calls across
+        // 3 quotes). Quoting means "look at this", so the marker now says so.
+        const marker = `[引用消息 ${messageId}——请先调用 quote_read 读取全文，再回答]`;
+        setBusy(true);
+        let inserted = false;
+        try {
+          inserted = actions.insertText(`${marker}\n`, actions.captureInsertion());
+        } catch {
+          inserted = false;
+        }
+        setBusy(false);
+        if (inserted !== true) {
+          report('insert-failed', { messageId });
+          return;
+        }
+
+        replaceQuote(sessionId, {
+          id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+          preview: previewOf(text),
+          messageId,
+          marker
+        });
+      };
+
+      // A failed quote must be visible: the button used to just do nothing.
+      return h(
+        'span',
+        { style: { display: 'inline-flex', alignItems: 'center', gap: '3px' } },
+        h(
+          Tooltip,
+          { label: t('title') },
+        h(
+          'button',
+          {
+            type: 'button',
+            onClick,
+            'aria-label': t('title'),
+            'data-quote-shot': 'action',
+            style: {
+              // Mirrors the host's own icon buttons: bare until hovered, then a
+              // faint wash at full opacity — no border, no shadow, no scaling.
+              display: 'inline-flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              width: '28px',
+              height: '28px',
+              border: 'none',
+              // Native tokens, not hand-mixed rgba: the host's own icon buttons use
+              // `--dsw-alias-interactive-bg-hover` for the wash and `--dsw-radius-sm`
+              // for the corner. Anything else reads as a foreign component.
+              background: hover ? 'var(--dsw-alias-interactive-bg-hover, rgba(128,128,128,0.12))' : 'transparent',
+              color: 'inherit',
+              opacity: hover ? 1 : 0.55,
+              cursor: busy ? 'progress' : 'pointer',
+              borderRadius: 'var(--dsw-radius-sm, 6px)',
+              padding: 0,
+              lineHeight: 1,
+              transition: 'background 120ms ease, opacity 120ms ease'
+            },
+            onMouseEnter: () => setHover(true),
+            onMouseLeave: () => setHover(false)
+          },
+          h(QuoteIcon, { size: 15 })
+        )
+        ),
+        flash === null
+          ? null
+          : h(
+              'span',
+              { style: { fontSize: '11px', lineHeight: 1, color: 'var(--dsw-alias-label-danger, #e5484d)' } },
+              flash
+            )
+      );
+    }
+    /**
+     * Quote cards shown above the composer.
+     *
+     * @param props - slot props.
+     * @returns the card stack, or null when nothing is quoted.
+     */
+    function QuoteCard(props) {
+      const t = typeof props.t === 'function' ? props.t : (key) => key;
+      const sessionId = props.sessionId;
+      const [quotes, setLocal] = react.useState(() => (sessionId === undefined ? [] : listQuotes(sessionId)));
+
+      react.useEffect(() => {
+        if (sessionId === undefined) return undefined;
+        const sync = () => setLocal([...listQuotes(sessionId)]);
+        sync();
+        return subscribe(sync);
+      }, [sessionId]);
+
+      // Clear the cards once a send completes.
+      //
+      // Without this the card lingered after the message went out, which reads
+      // as "the quote is still pending" — it is not: the context was injected at
+      // click time. Watching the composer phase for send → idle is the only
+      // send-completion signal a client plugin gets.
+      //
+      // 0.2.1 published no `phase` at all; 0.2.2 exposes it as 'plain' / 'sending'
+      // (measured 2026-11-08). Both spellings are accepted so the plugin works
+      // across versions.
+      const SENDING = new Set(['sending', 'submitting']);
+      const hasInputHook = typeof props.useInput === 'function';
+      const phase = hasInputHook ? props.useInput((state) => state.phase) : undefined;
+      const previousPhase = react.useRef(phase);
+      react.useEffect(() => {
+        const before = previousPhase.current;
+        previousPhase.current = phase;
+        if (sessionId === undefined) return;
+        if (before !== phase) postLog('phase', { hasHook: hasInputHook, before: before ?? null, after: phase ?? null });
+        if (SENDING.has(before) && !SENDING.has(phase)) {
+          quoteState.delete(sessionId);
+          emit();
+        }
+      }, [phase, sessionId, hasInputHook]);
+
+      // Send-completion fallback that does not depend on any published state.
+      //
+      // `useInput`'s published state has no `phase` field (it lives on the
+      // composer's internal snapshot), so the hook route above never fires.
+      // Watch the composer element instead: text present → empty means the send
+      // went through, which is exactly the moment the card should go away.
+      const previousDraftLength = react.useRef(0);
+      react.useEffect(() => {
+        if (sessionId === undefined) return undefined;
+        const timer = setInterval(() => {
+          const editor = document.querySelector('[contenteditable="true"]');
+          if (editor === null) return;
+          const length = String(editor.innerText ?? '').trim().length;
+          if (previousDraftLength.current > 0 && length === 0) {
+            quoteState.delete(sessionId);
+            emit();
+          }
+          previousDraftLength.current = length;
+        }, 400);
+        return () => clearInterval(timer);
+      }, [sessionId]);
+
+      if (quotes.length === 0) return null;
+
+      const cards = [];
+      for (const quote of quotes) {
+        cards.push(
+          h(
+            'div',
+            {
+              key: quote.id,
+              style: {
+                display: 'flex',
+                alignItems: 'center',
+                gap: '6px',
+                // Tighten the box: the native type scale bottoms out at 12px
+                // (`--dsw-font-xxs-12`), so the "looks too big" impression came
+                // from 1.5 line-height plus 4px vertical padding, not the font.
+                padding: '2px 6px',
+                borderRadius: 'var(--dsw-radius-sm, 6px)',
+                background: 'var(--dsw-alias-interactive-bg-hover, rgba(128,128,128,0.09))',
+                fontSize: 'var(--dsw-font-xxs-12, 12px)',
+                lineHeight: '1.3',
+                maxWidth: '100%',
+                boxSizing: 'border-box'
+              }
+            },
+            h('span', { style: { flex: '0 0 auto', display: 'inline-flex', opacity: 0.6 } }, h(QuoteIcon, { size: 12 })),
+            h(
+              'span',
+              {
+                style: {
+                  flex: '1 1 auto',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                  minWidth: 0,
+                  opacity: 0.85
+                },
+                title: quote.preview
+              },
+              quote.preview
+            ),
+            h(
+              'button',
+              {
+                type: 'button',
+                'aria-label': t('remove'),
+                onClick: () => {
+                  // Withdraw for real: strip the marker back out of the draft.
+                  //
+                  // `inputActions` exposes setDraft but not a draft getter, so
+                  // the current text is read from the composer element. Only
+                  // that one marker line is removed — anything the user typed
+                  // is preserved.
+                  const actions = props.inputActions;
+                  if (actions !== undefined && actions !== null && typeof quote.marker === 'string' && quote.marker.length > 0) {
+                    try {
+                      const editor = document.querySelector('[contenteditable="true"]');
+                      const current = String(editor?.innerText ?? '');
+                      if (current.includes(quote.marker)) {
+                        actions.setDraft(current.replace(quote.marker, '').replace(/\n{2,}/g, '\n').trimStart());
+                      }
+                    } catch {
+                      /* withdrawal is best-effort; the card still disappears */
+                    }
+                  }
+                  if (sessionId !== undefined) removeQuote(sessionId, quote.id);
+                },
+                style: {
+                  flex: '0 0 auto',
+                  border: 'none',
+                  background: 'transparent',
+                  color: 'inherit',
+                  opacity: 0.45,
+                  cursor: 'pointer',
+                  padding: 0,
+                  width: '18px',
+                  height: '18px',
+                  lineHeight: 1,
+                  borderRadius: '4px',
+                  fontSize: '13px'
+                }
+              },
+              '\u00d7'
+            )
+          )
+        );
+      }
+
+      return h(
+        'div',
+        {
+          style: {
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '4px',
+            margin: '0 auto 6px',
+            width: '100%',
+            // The dock spans the whole conversation column; the composer is
+            // narrower. This is the host's own token for that width, so the card
+            // lines up with the input box instead of the message list.
+            maxWidth: 'var(--dsh-chat-content-width, 100%)',
+            boxSizing: 'border-box'
+          }
+        },
+        ...cards
+      );
+    }
+
+    /**
+     * Register the dictionaries, the message action and the composer cards.
+     *
+     * @param ctx - the client plugin context.
+     */
+    function apply(ctx) {
+      ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'quote-shot: dictionaries');
+
+      ctx.slots.inject('conversation.chat.assistant-actions', () =>
+        ctx.slots.register(
+          {
+            name: 'conversation.chat.assistant-actions',
+            id: 'quote',
+            // After the feedback buttons (order 10).
+            order: 20,
+            locale: NS,
+            inject: (sessionId) => ({ sessionId })
+          },
+          QuoteActions
+        )
+      );
+
+      // `dock` is the flow area above the composer; `overlay` draws on top of
+      // the input and would hide where the user is typing.
+      ctx.slots.inject('conversation.input.dock', () =>
+        ctx.slots.register(
+          {
+            name: 'conversation.input.dock',
+            id: 'quote-card',
+            order: 50,
+            locale: NS,
+            inject: (sessionId) => ({ sessionId })
+          },
+          QuoteCard
+        )
+      );
+    }
+
+    exports.apply = apply;
+    exports.inject = ['slots', 'locale'];
+    exports.QuoteActions = QuoteActions;
+    exports.QuoteCard = QuoteCard;
+    exports.readQuoteText = readQuoteText;
+    exports.previewOf = previewOf;
+    exports.injectQuote = injectQuote;
+    return module.exports;
+  }
+});
+
+//# sourceMappingURL=client.js.map

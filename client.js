@@ -253,6 +253,78 @@ window.__ModuleLoader__.load({
      * @param messageId - quoted message id.
      * @returns true when something was found and scrolled to.
      */
+    /** The flash line currently on screen, so a second jump replaces it. */
+    let flashLine = null;
+
+    /**
+     * Draw a spindle line under a row for a moment.
+     *
+     * A full outline around the row was wrong: it framed whichever block the
+     * quote button happens to live in (often a file-change card). A thin line
+     * marks the position without claiming a boundary, and it is drawn as a
+     * fixed-position overlay so no host node is touched.
+     *
+     * @param row - the row to underline.
+     */
+    function flashRow(row) {
+      if (flashLine !== null) {
+        flashLine.remove();
+        flashLine = null;
+      }
+
+      const paint = () => {
+        const rect = row.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) return;
+        const line = document.createElement('div');
+        line.style.cssText = [
+          'position:fixed',
+          'pointer-events:none',
+          'z-index:2147483000',
+          `left:${rect.left + rect.width * 0.06}px`,
+          `width:${rect.width * 0.88}px`,
+          `top:${rect.bottom - 2}px`,
+          'height:3px',
+          'border-radius:2px',
+          'background:linear-gradient(90deg,transparent 0%,#4d6bfe 18%,#4d6bfe 82%,transparent 100%)',
+          'box-shadow:0 0 8px rgba(77,107,254,0.45)',
+          'opacity:0',
+          'transition:opacity 220ms ease'
+        ].join(';');
+        document.body.appendChild(line);
+        flashLine = line;
+        requestAnimationFrame(() => {
+          line.style.opacity = '1';
+        });
+        setTimeout(() => {
+          line.style.opacity = '0';
+        }, 1600);
+        setTimeout(() => {
+          line.remove();
+          if (flashLine === line) flashLine = null;
+        }, 2000);
+      };
+
+      // `scrollIntoView({behavior:'smooth'})` animates, so the row keeps moving
+      // for a few frames. Wait until its position settles before measuring.
+      let lastTop = Number.NaN;
+      let frames = 0;
+      const settle = () => {
+        frames += 1;
+        const top = row.getBoundingClientRect().top;
+        if (frames > 4 && Math.abs(top - lastTop) < 0.5) {
+          paint();
+          return;
+        }
+        lastTop = top;
+        if (frames > 90) {
+          paint();
+          return;
+        }
+        requestAnimationFrame(settle);
+      };
+      requestAnimationFrame(settle);
+    }
+
     function jumpToMessage(messageId) {
       const record = anchorFor(messageId);
       if (record === null) {
@@ -276,17 +348,7 @@ window.__ModuleLoader__.load({
       }
 
       row.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      const previousOutline = row.style.outline;
-      const previousOffset = row.style.outlineOffset;
-      const previousRadius = row.style.borderRadius;
-      row.style.outline = '2px solid #4d6bfe';
-      row.style.outlineOffset = '3px';
-      row.style.borderRadius = '10px';
-      setTimeout(() => {
-        row.style.outline = previousOutline;
-        row.style.outlineOffset = previousOffset;
-        row.style.borderRadius = previousRadius;
-      }, 1500);
+      flashRow(row);
       postLog('jump-ok', { messageId, key: record.key });
       return true;
     }

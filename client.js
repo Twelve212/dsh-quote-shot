@@ -316,19 +316,19 @@ window.__ModuleLoader__.load({
         }, 2000);
       };
 
-      // `scrollIntoView({behavior:'smooth'})` animates, so the row keeps moving
-      // for a few frames. Wait until its position settles before measuring.
-      let lastTop = Number.NaN;
+      // Wait until the row is actually INSIDE the viewport before measuring.
+      // Position stability alone is not enough: a scroll that has not started
+      // yet is perfectly stable, and measuring then draws the line off-screen.
       let frames = 0;
       const settle = () => {
         frames += 1;
-        const top = row.getBoundingClientRect().top;
-        if (frames > 4 && Math.abs(top - lastTop) < 0.5) {
+        const rect = row.getBoundingClientRect();
+        const inView = rect.bottom > 8 && rect.top < window.innerHeight - 8;
+        if (inView && frames >= 2) {
           paint();
           return;
         }
-        lastTop = top;
-        if (frames > 90) {
+        if (frames > 60) {
           paint();
           return;
         }
@@ -359,7 +359,10 @@ window.__ModuleLoader__.load({
         return false;
       }
 
-      row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      // `behavior: 'auto'` on purpose. Smooth scrolling a jump of tens of
+      // thousands of pixels takes longer than the measuring window, and the line
+      // was then painted at a stale position (measured top: -19816).
+      row.scrollIntoView({ behavior: 'auto', block: 'center' });
       flashRow(row);
       postLog('jump-ok', { messageId, key: record.key });
       return true;
